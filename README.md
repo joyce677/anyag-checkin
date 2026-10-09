@@ -303,11 +303,38 @@
 
 ## 代理配置（可选）
 
-内置的 `agentrouter` 默认 `use_proxy: true`。如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
+支持用一个 Clash / Mihomo 订阅，给不同账号固定分配不同节点。账号的浏览器登录、WAF cookies 获取和 HTTP 签到使用同一个出口。
 
 在仓库 Settings -> Environments -> production -> Environment secrets 中添加：
 
-- `PROXY_SUBSCRIPTION_URL`：Clash/Mihomo 订阅链接。设置后，workflow 会运行 `scripts/setup_mihomo_proxy.sh`，启动本地代理并写入 `CHECKIN_PROXY_URL`。
+- `PROXY_SUBSCRIPTION_URL`：机场的 **Clash / Mihomo YAML 订阅链接**，响应中需要有 `proxies` 列表；不是客户端的本地地址，也不是 Base64 通用订阅。
+- `PROXY_ACCOUNT_NODES`：可选的“账号名 → 节点完整名称”JSON。
+
+例如 3 个 AgentRouter、1 个噜皮、2 个 AnyRouter 账号：
+
+```json
+{
+  "AgentRouter-1": "香港 01",
+  "AgentRouter-2": "日本 01",
+  "AgentRouter-3": "新加坡 01",
+  "噜皮": "美国 01",
+  "AnyRouter-1": "香港 02",
+  "AnyRouter-2": "日本 02"
+}
+```
+
+左边必须与 `ANYROUTER_ACCOUNTS` 中的 `name` 完全一致，且账号名不能重复。右边是示例，请替换为机场节点的真实名称；包含国旗 emoji、空格、倍率或括号时都要原样复制。填写的是具体节点名，不是“自动选择”“节点选择”等代理组名称。多个账号也可以主动绑定同一个节点。
+
+**绑定规则：**
+
+- 配置了账号绑定，就使用该节点，优先于平台的 `use_proxy`；AnyRouter 和噜皮也能直接绑定，无需另外改 `PROVIDERS`。
+- 没有绑定的账号继续遵循平台设置：AgentRouter 默认使用共享代理，AnyRouter 和噜皮默认直连。只配置订阅、不配置账号绑定时，也是这个行为。
+- 每次运行下载一次订阅，为指定节点建立独立本地端口。指定节点不参与自动切换，本次运行中也不刷新节点定义。
+- 指定节点不存在、订阅下载失败或端口连通性检查失败时，任务报错停止；不会换节点或自动直连。账号名写错也会在登录之前报错。
+
+配置后在 Actions 手动运行，`providers` 填 `agentrouter,mlgb7,anyrouter`，可以立即测试全部账号。在“配置代理”步骤能看到 `[PROXY] 账号 → 节点 (本地端口)`，随后每个端口应显示 `Proxy is ready`。这个连通性检查不代表签到一定成功，还要检查“执行签到”的逐账号结果。
+
+不同节点不一定有不同的公网出口 IP，也不能保证同一节点的公网 IP 永久固定；需要固定 IP 时，应向代理服务商确认节点的出口性质。
 
 本地运行时也可以直接使用已有代理：
 
@@ -316,7 +343,7 @@ CHECKIN_PROXY_URL=http://127.0.0.1:7890
 PROVIDERS={"agentrouter":{"use_proxy":true}}
 ```
 
-如果使用订阅脚本，默认会用 `https://www.google.com/generate_204` 测试代理连通性；也可以通过 `PROXY_TEST_URL` 覆盖。
+订阅脚本默认用 `https://www.google.com/generate_204` 检查每个代理端口的连通性，也可以通过 `PROXY_TEST_URL` 覆盖。GitHub runner 上的 `127.0.0.1` 指本次运行启动的 Mihomo，不是你电脑上的 Clash。订阅链接只保存在 Secret 中，不要提交到仓库。
 
 ## 开启通知
 

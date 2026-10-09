@@ -39,7 +39,7 @@ from utils.debug import debug_print, is_debug_enabled
 from utils.mlgb import MlgbError
 from utils.mlgb import run_check_in as mlgb_check_in
 from utils.notify import notify
-from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.proxy import get_playwright_proxy, get_proxy_server, validate_account_proxy_names
 
 load_dotenv()
 
@@ -245,7 +245,7 @@ async def get_waf_cookies_with_browser(
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
 	launch_kwargs: dict = {'headless': True}
-	proxy = get_playwright_proxy(use_proxy=use_proxy)
+	proxy = get_playwright_proxy(account_name=account_name, use_proxy=use_proxy)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
 	browser = await launch_async(**launch_kwargs)
@@ -310,13 +310,8 @@ async def login_with_credentials(
 		f'humanize={settings.humanize}, timeout={timeout_ms}ms'
 	)
 
-	print(
-		f'[INFO] {account_name}: Provider proxy={"enabled" if provider_config.use_proxy else "disabled"} '
-		f'({provider_name})'
-	)
-
 	try:
-		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+		context = await launch_login_context(settings, account_name=account_name, use_proxy=provider_config.use_proxy)
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
 		return None
@@ -536,7 +531,7 @@ def run_mlgb_account(
 		print(f'[FAILED] {account_name}: 缺少会话 cookies')
 		return CheckInOutcome(STATUS_FAILED, '缺少会话 cookies'), None, None
 
-	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+	proxy_url = get_proxy_server(account_name=account_name, use_proxy=provider_config.use_proxy)
 	print(f'[NETWORK] {account_name}: Querying {provider_config.domain}/api/me')
 
 	try:
@@ -645,7 +640,7 @@ def run_check_in_requests(
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
 		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
-		proxy_url = get_proxy_server(use_proxy=use_proxy)
+		proxy_url = get_proxy_server(account_name=account_name, use_proxy=use_proxy)
 		if proxy_url:
 			client_kwargs['proxy'] = proxy_url
 			if is_debug_enabled():
@@ -728,7 +723,7 @@ async def main():
 		if proxy_server:
 			print(f'[INFO] Proxy endpoint available: {proxy_server} (enabled per provider use_proxy)')
 		else:
-			print('[INFO] CHECKIN_PROXY_URL not set; providers with use_proxy=true will run without proxy')
+			print('[INFO] Shared CHECKIN_PROXY_URL not set; account proxy bindings take precedence')
 	else:
 		print('[INFO] Debug mode disabled (set DEBUG_MODE=true to enable screenshots and verbose logs)')
 
@@ -752,6 +747,11 @@ async def main():
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
+	try:
+		validate_account_proxy_names([account.get_display_name(i) for i, account in enumerate(accounts)])
+	except ValueError as exc:
+		print(f'[FAILED] {exc}')
+		sys.exit(1)
 
 	accounts, skipped_accounts = filter_accounts_by_provider(accounts, os.getenv('CHECKIN_PROVIDERS'))
 	for skipped in skipped_accounts:
