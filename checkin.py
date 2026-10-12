@@ -731,6 +731,17 @@ def filter_accounts_by_provider(
 	return kept, skipped
 
 
+def detect_group_change(account_name: str, previous_group: str | None, current_group: str | None) -> str | None:
+	"""分组变化时给出一句提示，否则返回 None。
+
+	分组平时是静态的，所以不占用通知版面；但它一旦变了（可用模型、计费倍率都会
+	跟着变），那才是值得单独知道的事。拿不到分组（比如 mlgb7 这类平台）时不报。
+	"""
+	if not previous_group or not current_group or previous_group == current_group:
+		return None
+	return f'{account_name} {previous_group} → {current_group}'
+
+
 async def main():
 	"""主函数"""
 	if is_debug_enabled():
@@ -783,13 +794,16 @@ async def main():
 	gained_count = 0
 	credit_known = 0
 	status_lines: list[str] = []
+	group_changes: list[str] = []
 	current_balances = {}
 	need_notify = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		account_name = account.get_display_name(i)
-		baseline_total, baseline_day = resolve_baseline(checkin_state.get(account_name), today)
+		stored_state = checkin_state.get(account_name)
+		baseline_total, baseline_day = resolve_baseline(stored_state, today)
+		previous_group = (stored_state or {}).get('group')
 		try:
 			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if outcome.success:
@@ -808,11 +822,22 @@ async def main():
 					'quota': user_info_after['quota'],
 					'used': user_info_after['used_quota'],
 				}
+
+				# 分组平时不变，所以不占用通知版面；一旦变了（可用模型/计费都会跟着变）
+				# 才单独提示一句。
+				group = user_info_after.get('group') or previous_group
+				change = detect_group_change(account_name, previous_group, group)
+				if change:
+					group_changes.append(change)
+					print(f'[WARN] {account_name}: group changed {previous_group} -> {group}')
+					need_notify = True
+
 				checkin_state[account_name] = {
 					'day': today,
 					'baseline_total': baseline_total,
 					'baseline_day': baseline_day,
 					'last_total': total_after,
+					'group': group,
 				}
 			elif user_info_before and user_info_before.get('success'):
 				checkin_state[account_name] = {
@@ -820,6 +845,7 @@ async def main():
 					'baseline_total': baseline_total,
 					'baseline_day': baseline_day,
 					'last_total': round(user_info_before['quota'] + user_info_before['used_quota'], 2),
+					'group': user_info_before.get('group') or previous_group,
 				}
 
 			status_lines.append(
@@ -873,6 +899,8 @@ async def main():
 			# 标题直接给"几个账号到账了"，而不是"几个账号登录成功了"
 			header += f' · 到账 {gained_count}/{total_count}'
 		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])
+		if group_changes:
+			notify_content += '\n\n' + '\n'.join(f'⚠️ 分组变化：{item}' for item in group_changes)
 
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
