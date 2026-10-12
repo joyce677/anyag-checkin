@@ -392,11 +392,22 @@ def get_user_info(client, headers, user_info_url: str):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+
+				# NewAPI 会在 /api/user/self 里给出账号所属分组（不同分组计费/可用模型不同），
+				# 顺便读出来。字段缺失时把可用字段名打出来，方便排查不同部署的差异。
+				group = user_data.get('group')
+				display = f':money: Current balance: ${quota}, Used: ${used_quota}'
+				if group:
+					display += f' | group: {group}'
+				else:
+					print(f'[WARN] /api/user/self 没有 group 字段，可用字段: {sorted(user_data.keys())}')
+
 				return {
 					'success': True,
 					'quota': quota,
 					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'group': group,
+					'display': display,
 				}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
