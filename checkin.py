@@ -387,11 +387,22 @@ def get_user_info(client, headers, user_info_url: str):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+
+				# NewAPI 会在 /api/user/self 里给出账号所属分组（不同分组计费/可用模型不同），
+				# 顺便读出来。字段缺失时把可用字段名打出来，方便排查不同部署的差异。
+				group = user_data.get('group')
+				display = f':money: Current balance: ${quota}, Used: ${used_quota}'
+				if group:
+					display += f' | group: {group}'
+				else:
+					print(f'[WARN] /api/user/self 没有 group 字段，可用字段: {sorted(user_data.keys())}')
+
 				return {
 					'success': True,
 					'quota': quota,
 					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'group': group,
+					'display': display,
 				}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
@@ -715,6 +726,41 @@ def filter_accounts_by_provider(
 	return kept, skipped
 
 
+def processed_today(state: dict, account: AccountConfig, today: str) -> bool:
+	"""该账号今天是否已经成功处理过（用于过滤后的补签判断）。
+
+	state 以账号显示名为键；没有显式 name 的账号定位不到，保守地当作"没处理过"——
+	宁可多跑一次，也别漏签。
+	"""
+	if not account.name:
+		return False
+	return (state.get(account.name) or {}).get('day') == today
+
+
+def split_stale_accounts(
+	state: dict, skipped: list[AccountConfig], today: str
+) -> tuple[list[AccountConfig], list[AccountConfig]]:
+	"""把被 provider 过滤掉的账号分成「今天还没处理（要补签）」和「今天已处理」。
+
+	返回 (要补签的, 可以跳过的)。
+	"""
+	carried = [account for account in skipped if not processed_today(state, account, today)]
+	carried_ids = {id(account) for account in carried}
+	remaining = [account for account in skipped if id(account) not in carried_ids]
+	return carried, remaining
+
+
+def detect_group_change(account_name: str, previous_group: str | None, current_group: str | None) -> str | None:
+	"""分组变化时给出一句提示，否则返回 None。
+
+	分组平时是静态的，所以不占用通知版面；但它一旦变了（可用模型、计费倍率都会
+	跟着变），那才是值得单独知道的事。拿不到分组（比如 mlgb7 这类平台）时不报。
+	"""
+	if not previous_group or not current_group or previous_group == current_group:
+		return None
+	return f'{account_name} {previous_group} → {current_group}'
+
+
 async def main():
 	"""主函数"""
 	if is_debug_enabled():
@@ -753,7 +799,22 @@ async def main():
 		print(f'[FAILED] {exc}')
 		sys.exit(1)
 
+	last_balance_hash = load_balance_hash()
+	checkin_state = load_checkin_state()
+	today = current_day()
+	print(f'[INFO] Sign-in day: {today}, state loaded for {len(checkin_state)} account(s)')
+
+	# 按 provider 收窄本次范围；但被跳过的账号里「今天还没成功处理过的」仍然补上。
+	# 否则某个槽位被 GitHub 丢弃时（实测经常发生），那批账号会整整一天不签到 ——
+	# 比如 10-13 傍晚那次被丢，ag+mlgb7 的 00:01 签到就整天空了。
 	accounts, skipped_accounts = filter_accounts_by_provider(accounts, os.getenv('CHECKIN_PROVIDERS'))
+	if skipped_accounts:
+		carried, skipped_accounts = split_stale_accounts(checkin_state, skipped_accounts, today)
+		if carried:
+			for account in carried:
+				print(f'[CATCH-UP] {account.name or account.provider}: 今天还没签到过，本次一并处理')
+			accounts = accounts + carried
+
 	for skipped in skipped_accounts:
 		print(f'[SKIP] {skipped.name or skipped.provider}: provider "{skipped.provider}" 不在本次范围内')
 	if not accounts:
@@ -762,27 +823,28 @@ async def main():
 	if skipped_accounts:
 		print(f'[INFO] Processing {len(accounts)} account(s), skipped {len(skipped_accounts)}')
 
-	last_balance_hash = load_balance_hash()
-	checkin_state = load_checkin_state()
-	today = current_day()
-	print(f'[INFO] Sign-in day: {today}, state loaded for {len(checkin_state)} account(s)')
-
 	success_count = 0
 	total_count = len(accounts)
 	gained_count = 0
 	credit_known = 0
 	status_lines: list[str] = []
+	group_changes: list[str] = []
 	current_balances = {}
 	need_notify = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		account_name = account.get_display_name(i)
-		baseline_total, baseline_day = resolve_baseline(checkin_state.get(account_name), today)
+		stored_state = checkin_state.get(account_name)
+		baseline_total, baseline_day = resolve_baseline(stored_state, today)
+		previous_group = (stored_state or {}).get('group')
 		try:
 			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if outcome.success:
 				success_count += 1
+				# 记下"今天已处理"，供过滤后的补签判断使用。
+				# 失败时**不写**，这样下次运行仍会被补签捞起来重试。
+				checkin_state.setdefault(account_name, {})['day'] = today
 
 			# 跨运行的总量比较：抓单次运行窗口之外的到账。
 			# 总量 = 余额 + 累计消耗，消费时两者一增一减恰好抵消，所以它不受日常消耗干扰。
@@ -797,11 +859,22 @@ async def main():
 					'quota': user_info_after['quota'],
 					'used': user_info_after['used_quota'],
 				}
+
+				# 分组平时不变，所以不占用通知版面；一旦变了（可用模型/计费都会跟着变）
+				# 才单独提示一句。
+				group = user_info_after.get('group') or previous_group
+				change = detect_group_change(account_name, previous_group, group)
+				if change:
+					group_changes.append(change)
+					print(f'[WARN] {account_name}: group changed {previous_group} -> {group}')
+					need_notify = True
+
 				checkin_state[account_name] = {
 					'day': today,
 					'baseline_total': baseline_total,
 					'baseline_day': baseline_day,
 					'last_total': total_after,
+					'group': group,
 				}
 			elif user_info_before and user_info_before.get('success'):
 				checkin_state[account_name] = {
@@ -809,6 +882,7 @@ async def main():
 					'baseline_total': baseline_total,
 					'baseline_day': baseline_day,
 					'last_total': round(user_info_before['quota'] + user_info_before['used_quota'], 2),
+					'group': user_info_before.get('group') or previous_group,
 				}
 
 			status_lines.append(
@@ -862,6 +936,8 @@ async def main():
 			# 标题直接给"几个账号到账了"，而不是"几个账号登录成功了"
 			header += f' · 到账 {gained_count}/{total_count}'
 		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])
+		if group_changes:
+			notify_content += '\n\n' + '\n'.join(f'⚠️ 分组变化：{item}' for item in group_changes)
 
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
