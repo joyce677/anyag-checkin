@@ -731,6 +731,30 @@ def filter_accounts_by_provider(
 	return kept, skipped
 
 
+def processed_today(state: dict, account: AccountConfig, today: str) -> bool:
+	"""该账号今天是否已经成功处理过（用于过滤后的补签判断）。
+
+	state 以账号显示名为键；没有显式 name 的账号定位不到，保守地当作"没处理过"——
+	宁可多跑一次，也别漏签。
+	"""
+	if not account.name:
+		return False
+	return (state.get(account.name) or {}).get('day') == today
+
+
+def split_stale_accounts(
+	state: dict, skipped: list[AccountConfig], today: str
+) -> tuple[list[AccountConfig], list[AccountConfig]]:
+	"""把被 provider 过滤掉的账号分成「今天还没处理（要补签）」和「今天已处理」。
+
+	返回 (要补签的, 可以跳过的)。
+	"""
+	carried = [account for account in skipped if not processed_today(state, account, today)]
+	carried_ids = {id(account) for account in carried}
+	remaining = [account for account in skipped if id(account) not in carried_ids]
+	return carried, remaining
+
+
 def detect_group_change(account_name: str, previous_group: str | None, current_group: str | None) -> str | None:
 	"""分组变化时给出一句提示，否则返回 None。
 
@@ -775,7 +799,22 @@ async def main():
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
+	last_balance_hash = load_balance_hash()
+	checkin_state = load_checkin_state()
+	today = current_day()
+	print(f'[INFO] Sign-in day: {today}, state loaded for {len(checkin_state)} account(s)')
+
+	# 按 provider 收窄本次范围；但被跳过的账号里「今天还没成功处理过的」仍然补上。
+	# 否则某个槽位被 GitHub 丢弃时（实测经常发生），那批账号会整整一天不签到 ——
+	# 比如 10-13 傍晚那次被丢，ag+mlgb7 的 00:01 签到就整天空了。
 	accounts, skipped_accounts = filter_accounts_by_provider(accounts, os.getenv('CHECKIN_PROVIDERS'))
+	if skipped_accounts:
+		carried, skipped_accounts = split_stale_accounts(checkin_state, skipped_accounts, today)
+		if carried:
+			for account in carried:
+				print(f'[CATCH-UP] {account.name or account.provider}: 今天还没签到过，本次一并处理')
+			accounts = accounts + carried
+
 	for skipped in skipped_accounts:
 		print(f'[SKIP] {skipped.name or skipped.provider}: provider "{skipped.provider}" 不在本次范围内')
 	if not accounts:
@@ -783,11 +822,6 @@ async def main():
 		sys.exit(1)
 	if skipped_accounts:
 		print(f'[INFO] Processing {len(accounts)} account(s), skipped {len(skipped_accounts)}')
-
-	last_balance_hash = load_balance_hash()
-	checkin_state = load_checkin_state()
-	today = current_day()
-	print(f'[INFO] Sign-in day: {today}, state loaded for {len(checkin_state)} account(s)')
 
 	success_count = 0
 	total_count = len(accounts)
@@ -808,6 +842,9 @@ async def main():
 			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if outcome.success:
 				success_count += 1
+				# 记下"今天已处理"，供过滤后的补签判断使用。
+				# 失败时**不写**，这样下次运行仍会被补签捞起来重试。
+				checkin_state.setdefault(account_name, {})['day'] = today
 
 			# 跨运行的总量比较：抓单次运行窗口之外的到账。
 			# 总量 = 余额 + 累计消耗，消费时两者一增一减恰好抵消，所以它不受日常消耗干扰。
