@@ -31,6 +31,11 @@ on:
         required: false
         default: false
         type: boolean
+      force:
+        description: 强制重跑今天已签到的账号（日常不要开，会被站点二次登录限流）
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   checkin:
@@ -123,6 +128,9 @@ jobs:
     - name: 执行签到
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
+        # 今天已成功签到的账号默认跳过（schedule 槽位延迟会导致同一批号一天被触发两三次，
+        # 重复签到会被站点按二次登录挡掉）。排查时手动勾 force 才重跑。
+        CHECKIN_FORCE: ${{ github.event.inputs.force == 'true' && '1' || '' }}
         # CHECKIN_PROVIDERS 由上一步「对齐到北京时间目标时刻」通过 $GITHUB_ENV 写入
         # （手动触发时它会把 providers 输入原样透传），这里不要再写死，否则会覆盖。
         CHECKIN_HEADLESS: false

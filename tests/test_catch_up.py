@@ -11,7 +11,12 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import processed_today, split_stale_accounts
+from checkin import (
+	already_done_this_run,
+	force_checkin_enabled,
+	processed_today,
+	split_stale_accounts,
+)
 from utils.config import AccountConfig
 
 TODAY = '2026-10-14'
@@ -97,3 +102,58 @@ def test_mlgb7_without_user_info_still_counts_once_day_is_recorded():
 
 	assert processed_today(state, MLGB, TODAY) is True
 	assert split_stale_accounts(state, [MLGB], TODAY) == ([], [MLGB])
+
+
+# --- already_done_this_run：兜底轮不重复签今天已到账的账号 -----------------------
+
+
+def test_skips_account_already_credited_today():
+	"""真实案例：10-17 00:01 已到账的 agLD/agGithub/mlgb7，被 00:32 的兜底轮又跑了一遍，
+	agLD/agGithub 全被挡成「邮箱密码登录失败」—— 这轮本该直接跳过它们。"""
+	state = {
+		'agLD': {'day': TODAY, 'credited_day': TODAY},
+		'agGithub': {'day': TODAY, 'credited_day': TODAY},
+		'mlgb7': {'day': TODAY, 'credited_day': TODAY},
+	}
+
+	assert [already_done_this_run(state, a, TODAY) for a in (AG_LD, AG_GH, MLGB)] == [True] * 3
+
+
+def test_logged_in_but_not_credited_is_retried():
+	"""anyrouter 北京 08:05 之后登录才赠送：00:32 那次只能拿到「未到账」，
+	若按「今天跑过」就跳过，早晨 08:01 那轮会把当天额度整天空掉。"""
+	state = {'any主帐号': {'day': TODAY, 'baseline_total': 100.0, 'last_total': 100.0}}
+
+	assert already_done_this_run(state, ANY, TODAY) is False
+
+
+def test_failed_account_is_retried_in_same_day():
+	"""失败既不写 day 也不写 credited_day，所以同一天后面那轮还会再试一次。"""
+	state = {'agLD': {'day': '2026-10-13', 'last_total': 100.0}}
+
+	assert already_done_this_run(state, AG_LD, TODAY) is False
+
+
+def test_yesterday_credit_does_not_skip_today():
+	state = {'agLD': {'day': '2026-10-13', 'credited_day': '2026-10-13'}}
+
+	assert already_done_this_run(state, AG_LD, TODAY) is False
+
+
+def test_force_flag_overrides_skip():
+	state = {'agLD': {'day': TODAY, 'credited_day': TODAY}}
+
+	assert already_done_this_run(state, AG_LD, TODAY, relogin_allowed=True) is False
+
+
+def test_force_flag_off_by_default(monkeypatch):
+	monkeypatch.delenv('CHECKIN_FORCE', raising=False)
+	assert force_checkin_enabled() is False
+
+	for raw in ('1', 'true', 'TRUE', 'yes'):
+		monkeypatch.setenv('CHECKIN_FORCE', raw)
+		assert force_checkin_enabled() is True
+
+	for raw in ('0', 'false', '', 'no'):
+		monkeypatch.setenv('CHECKIN_FORCE', raw)
+		assert force_checkin_enabled() is False
