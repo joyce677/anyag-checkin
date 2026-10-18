@@ -63,11 +63,17 @@ STATUS_ALREADY_CHECKED = 'already_checked'
 STATUS_LOGGED_IN = 'logged_in'
 STATUS_FAILED = 'failed'
 
+# STATUS_SKIPPED_TODAY 也不来自平台：它是本地状态机判出来的——今天早些时候已经
+# 成功签过这个账号，本轮连登录请求都不发。与 ALREADY_CHECKED 的区别是证据来源：
+# 那个是平台回执「今天签过了」，这个是「我们自己今天签成功过，别再去打扰它」。
+STATUS_SKIPPED_TODAY = 'skipped_today'
+
 # 精简版标签：通知改成一行一个账号，标签必须短。
 CHECK_IN_STATUS_LABELS = {
 	STATUS_CHECKED_IN: '✅ 签到成功',
 	STATUS_ALREADY_CHECKED: '✅ 今日已签到',
 	STATUS_LOGGED_IN: '✅ 已登录',
+	STATUS_SKIPPED_TODAY: '⏭️ 今日已签到',
 	STATUS_FAILED: '❌ 签到失败',
 }
 
@@ -726,6 +732,17 @@ def filter_accounts_by_provider(
 	return kept, skipped
 
 
+def force_checkin_enabled() -> bool:
+	"""是否强制忽略「今天已签过」直接重跑（CHECKIN_FORCE=1）。
+
+	平时不需要开：GitHub 的 schedule 槽位经常延迟落地，同一批账号一天里会被
+	触发两三次，重复签到不但没有收益，还会撞上站点的二次登录限流
+	（10-17 00:32 那轮就是把 00:01 刚签成功的 agLD/agGithub 又登了一遍，
+	两张号全被挡成「邮箱密码登录失败」）。只在排查时需要时手动强制。
+	"""
+	return os.getenv('CHECKIN_FORCE', '').strip().lower() in ('1', 'true', 'yes')
+
+
 def processed_today(state: dict, account: AccountConfig, today: str) -> bool:
 	"""该账号今天是否已经成功处理过（用于过滤后的补签判断）。
 
@@ -735,6 +752,20 @@ def processed_today(state: dict, account: AccountConfig, today: str) -> bool:
 	if not account.name:
 		return False
 	return (state.get(account.name) or {}).get('day') == today
+
+
+def already_done_this_run(state: dict, account: AccountConfig, today: str, *, relogin_allowed: bool = False) -> bool:
+	"""本轮该不该跳过这个账号：今天已经**确认到账**过，且没开强制重跑。
+
+	判据是 credited_day 而不是 day，这点很关键：anyrouter 在北京 08:05 之后登录才
+	赠送，凌晨那次登录只会拿回「未到账」。若按「今天跑过」跳过，早晨那轮会把它的
+	额度整天空掉。失败、未到账都不写 credited_day，所以后续轮次仍会重试。
+	"""
+	if relogin_allowed:
+		return False
+	if not account.name:
+		return False
+	return (state.get(account.name) or {}).get('credited_day') == today
 
 
 def split_stale_accounts(
@@ -831,6 +862,12 @@ async def main():
 	group_changes: list[str] = []
 	current_balances = {}
 	need_notify = False
+	# 今天已确认到账的账号不再重跑：schedule 槽位延迟落地会让同一批账号一天被触发两三次，
+	# 重复签到没有收益，还会被平台按二次登录挡掉（详见 force_checkin_enabled 注释）。
+	relogin_allowed = force_checkin_enabled()
+	skipped_today: list[str] = []
+	if relogin_allowed:
+		print('[INFO] CHECKIN_FORCE 已开启：忽略「今天已到账」，全部账号重跑')
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -838,6 +875,15 @@ async def main():
 		stored_state = checkin_state.get(account_name)
 		baseline_total, baseline_day = resolve_baseline(stored_state, today)
 		previous_group = (stored_state or {}).get('group')
+
+		if already_done_this_run(checkin_state, account, today, relogin_allowed=relogin_allowed):
+			skipped_today.append(account_name)
+			status_lines.append(
+				f'{account_name} · {CHECK_IN_STATUS_LABELS[STATUS_SKIPPED_TODAY]} · 本轮跳过，不重复请求'
+			)
+			print(f'[SKIP] {account_name}: already credited today, skipping this run')
+			continue
+
 		try:
 			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if outcome.success:
@@ -885,6 +931,11 @@ async def main():
 					'group': user_info_before.get('group') or previous_group,
 				}
 
+			# 「确认到账」才是真正的完成态，也是后面几轮是否跳过它的唯一依据。
+			# 登录成功但没到账（anyrouter 北京 08:05 前登录就是这种）不算完成。
+			if outcome.success and (outcome.credited or (day_gain is not None and day_gain > 0)):
+				checkin_state.setdefault(account_name, {})['credited_day'] = today
+
 			status_lines.append(
 				format_account_line(
 					account_name,
@@ -915,6 +966,11 @@ async def main():
 			status_lines.append(f'{account_name} · ❌ 执行异常 · {str(e)[:50]}...')
 
 	save_checkin_state(checkin_state)
+
+	# 跳过的账号不进「到账 x/y」的分母：这轮根本没去查它们，算进去只会被读成「没到账」。
+	total_count = len(accounts) - len(skipped_today)
+	if skipped_today:
+		print(f'[INFO] {len(skipped_today)} account(s) already done today, skipped: {", ".join(skipped_today)}')
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
@@ -957,7 +1013,8 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	sys.exit(0 if success_count > 0 else 1)
+	# 今天已签过而被跳过的账号也算「这轮没出错」，否则全跳过的兜底轮会被标成失败。
+	sys.exit(0 if (success_count + len(skipped_today)) > 0 else 1)
 
 
 def run_main():
